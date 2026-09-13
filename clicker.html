@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Clicker">
+<meta name="theme-color" content="#241C17">
+<title>Clicker</title>
+<style>
+  :root {
+    --ground: #241C17;
+    --taupe:  #8A7A66;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  body {
+    background: var(--ground);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: manipulation;
+  }
+
+  #pad {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    padding: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  #pad:focus-visible { outline: 2px solid #C9962F; outline-offset: -10px; }
+
+  .eye {
+    width: min(74vw, 400px);
+    aspect-ratio: 1.9 / 1;
+    background: radial-gradient(ellipse at 50% 45%, #E0AC3D 0%, #A87524 62%, #6B4A16 100%);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: inset 0 3px 20px rgba(0,0,0,.55);
+  }
+
+  .pupil {
+    width: 22%;
+    height: 84%;
+    background: #16100C;
+    border-radius: 50%;
+    transform-origin: center;
+    transition: transform 320ms cubic-bezier(.16,1,.3,1);
+  }
+
+  .pupil.snap {
+    transform: scaleX(.18);
+    transition: transform 22ms linear;
+  }
+
+  #hint {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: calc(9% + env(safe-area-inset-bottom));
+    text-align: center;
+    font-size: 14px;
+    color: var(--taupe);
+    transition: opacity 500ms ease;
+  }
+
+  #hint.gone { opacity: 0; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pupil, .pupil.snap { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<button id="pad" aria-label="Click">
+  <div class="eye"><div class="pupil" id="pupil"></div></div>
+</button>
+<div id="hint">Tap anywhere</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var SR  = 44100;
+  var HZ  = 3500;      // pitch of the snap
+  var DUR = 0.25;
+  var GAP = 0.08;     // press-down to release; below ~20ms the two fuse into one
+  var VOL = 0.85;
+
+  var ctx = null, master = null, buffer = null;
+  var padEl   = document.getElementById('pad');
+  var pupilEl = document.getElementById('pupil');
+  var hintEl  = document.getElementById('hint');
+
+  /* One snap of the metal tongue: a noise impulse struck through three
+     resonances. Real clickers are noise, not tone — that's what makes it
+     read as a snap rather than a beep. */
+  function snap(off, dest, at, hz, amp, decay) {
+    var n = Math.ceil(SR * 0.035);
+    var b = off.createBuffer(1, n, SR);
+    var d = b.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+
+    var src = off.createBufferSource();
+    src.buffer = b;
+
+    var env = off.createGain();
+    env.gain.setValueAtTime(0.0001, at);
+    env.gain.exponentialRampToValueAtTime(1, at + 0.0002);
+    env.gain.exponentialRampToValueAtTime(0.0001, at + decay);
+
+    var body = off.createBiquadFilter();
+    body.type = 'bandpass'; body.frequency.value = hz; body.Q.value = 8;
+    var g1 = off.createGain(); g1.gain.value = amp;
+
+    var upper = off.createBiquadFilter();
+    upper.type = 'bandpass'; upper.frequency.value = hz * 2.4; upper.Q.value = 10;
+    var g2 = off.createGain(); g2.gain.value = amp * 0.32;
+
+    var edge = off.createBiquadFilter();
+    edge.type = 'highpass'; edge.frequency.value = hz * 3;
+    var g3 = off.createGain(); g3.gain.value = amp * 0.16;
+
+    src.connect(env);
+    env.connect(body).connect(g1).connect(dest);
+    env.connect(upper).connect(g2).connect(dest);
+    env.connect(edge).connect(g3).connect(dest);
+
+    src.start(at);
+    src.stop(at + 0.035);
+  }
+
+  /* Rendered once, offline, at load. A tap is then just start() on a
+     pre-baked buffer — the fastest path the browser offers. */
+  function render() {
+    var OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    var off = new OC(1, Math.ceil(SR * DUR), SR);
+
+    var out = off.createGain();
+    out.gain.value = 1;
+    out.connect(off.destination);
+
+    snap(off, out, 0,   HZ,        1.00, 0.008);   // press down
+    snap(off, out, GAP, HZ * 0.78, 0.58, 0.006);   // release — lower, softer
+
+    off.startRendering().then(function (buf) {
+      var d = buf.getChannelData(0), peak = 0;
+      for (var i = 0; i < d.length; i++) { var a = Math.abs(d[i]); if (a > peak) peak = a; }
+      if (peak > 0) { var k = 0.95 / peak; for (var j = 0; j < d.length; j++) d[j] *= k; }
+      buffer = buf;
+    });
+  }
+
+  function initAudio() {
+    if (ctx) return;
+    try { navigator.audioSession.type = 'playback'; } catch (e) {}   // beat the mute switch
+    var AC = window.AudioContext || window.webkitAudioContext;
+    ctx = new AC({ latencyHint: 'interactive', sampleRate: SR });
+    master = ctx.createGain();
+    master.gain.value = VOL;
+    master.connect(ctx.destination);
+
+    // Prime the output so the first real click isn't the one that wakes it.
+    var s = ctx.createBufferSource();
+    s.buffer = ctx.createBuffer(1, 1, SR);
+    s.connect(ctx.destination);
+    s.start(0);
+  }
+
+  function click() {
+    initAudio();
+    if (ctx.state === 'suspended') ctx.resume();
+    if (buffer) {
+      var src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(master);
+      src.start(0);
+    }
+    pupilEl.classList.remove('snap');
+    void pupilEl.offsetWidth;                       // reflow so repeat taps re-trigger
+    pupilEl.classList.add('snap');
+    setTimeout(function () { pupilEl.classList.remove('snap'); }, 30);
+    hintEl.classList.add('gone');
+  }
+
+  padEl.addEventListener('pointerdown', function (e) { e.preventDefault(); click(); });
+  padEl.addEventListener('keydown', function (e) {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); click(); }
+  });
+
+  // Keep the screen awake during a session; iOS drops the lock on backgrounding.
+  var lock = null;
+  function requestLock() {
+    if (!('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function (l) { lock = l; }).catch(function () {});
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') requestLock();
+  });
+  padEl.addEventListener('pointerdown', function () { if (!lock) requestLock(); }, { once: true });
+
+  render();
+})();
+</script>
+</body>
+</html>
