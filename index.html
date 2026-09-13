@@ -41,8 +41,6 @@
     border: 0;
     padding: 0;
     background: none;
-    color: inherit;
-    font: inherit;
     cursor: pointer;
   }
 
@@ -57,6 +55,14 @@
     align-items: center;
     justify-content: center;
     box-shadow: inset 0 3px 20px rgba(0,0,0,.55);
+    transition: filter 200ms ease;
+  }
+
+  /* Tap seen but ignored: the eye flinches dark and eases back, and the pupil
+     deliberately does NOT snap. Absence of the snap is the real signal. */
+  .eye.blocked {
+    filter: brightness(.38) saturate(.4);
+    transition: filter 40ms linear;
   }
 
   .pupil {
@@ -80,20 +86,24 @@
     text-align: center;
     font-size: 14px;
     color: var(--taupe);
+    /* Sits on top of the pad. Without this it swallows taps in a strip across
+       the bottom of the screen — and keeps swallowing them after it fades,
+       since opacity 0 still receives touches. */
+    pointer-events: none;
     transition: opacity 500ms ease;
   }
 
   #hint.gone { opacity: 0; }
 
   @media (prefers-reduced-motion: reduce) {
-    .pupil, .pupil.snap { transition: none; }
+    .pupil, .pupil.snap, .eye, .eye.blocked { transition: none; }
   }
 </style>
 </head>
 <body>
 
 <button id="pad" aria-label="Click">
-  <div class="eye"><div class="pupil" id="pupil"></div></div>
+  <div class="eye" id="eye"><div class="pupil" id="pupil"></div></div>
 </button>
 <div id="hint">Tap anywhere</div>
 
@@ -103,59 +113,57 @@
 
   var SR  = 44100;
   var HZ  = 3500;      // pitch of the snap
-  var DUR = 0.13;
+  var DUR = 0.25;
   var GAP = 0.08;      // press-down to release; below ~20ms the two fuse into one
   var VOL = 0.85;
+  var LOCKOUT = 900;   // ms after a click during which further taps are ignored
 
   var ctx = null, master = null, buffer = null, unlocked = false;
   var padEl   = document.getElementById('pad');
+  var eyeEl   = document.getElementById('eye');
   var pupilEl = document.getElementById('pupil');
   var hintEl  = document.getElementById('hint');
 
   /* ---------- synthesis ---------- */
-  /* Built synchronously with hand-rolled biquads rather than an
-     OfflineAudioContext, so the buffer exists before any tap can land.
-     The old version rendered via a promise — tap before it resolved and
-     you got silence, then sound on the next tap. That read as lag. */
 
-  function bp(f0, Q) {
-    var w = 2*Math.PI*f0/SR, a = Math.sin(w)/(2*Q), c = Math.cos(w), a0 = 1+a;
-    return [a/a0, 0, -a/a0, (-2*c)/a0, (1-a)/a0];
-  }
+  /* One biquad section, designed and applied in a single pass. The Nyquist
+     clamp lives here so callers can ask for any frequency safely. */
+  function resonate(x, type, f0, Q) {
+    var w = 2*Math.PI*Math.min(f0, SR*0.45)/SR;
+    var a = Math.sin(w)/(2*Q), c = Math.cos(w), a0 = 1+a, b0, b1, b2;
 
-  function hp(f0, Q) {
-    var w = 2*Math.PI*f0/SR, a = Math.sin(w)/(2*Q), c = Math.cos(w), a0 = 1+a;
-    return [((1+c)/2)/a0, (-(1+c))/a0, ((1+c)/2)/a0, (-2*c)/a0, (1-a)/a0];
-  }
+    if (type === 'hp') { b0 = (1+c)/2; b1 = -(1+c); b2 = (1+c)/2; }
+    else               { b0 = a;       b1 = 0;      b2 = -a;      }
+    b0 /= a0; b1 /= a0; b2 /= a0;
+    var a1 = (-2*c)/a0, a2 = (1-a)/a0;
 
-  function filt(x, k) {
     var y = new Float32Array(x.length), x1=0, x2=0, y1=0, y2=0;
     for (var i = 0; i < x.length; i++) {
-      var v = k[0]*x[i] + k[1]*x1 + k[2]*x2 - k[3]*y1 - k[4]*y2;
+      var v = b0*x[i] + b1*x1 + b2*x2 - a1*y1 - a2*y2;
       x2=x1; x1=x[i]; y2=y1; y1=v; y[i]=v;
     }
     return y;
   }
 
-  /* One snap of the metal tongue: a noise impulse struck through three
-     resonances. Real clickers are noise, not tone — that's what makes it
-     read as a snap rather than a beep. */
+  /* Two snaps of the metal tongue, each a noise impulse struck through three
+     resonances. Real clickers are noise, not tone — that's what makes it read
+     as a snap rather than a beep. Built synchronously so the buffer exists
+     before any tap can land. */
   function build(hz) {
     var out = new Float32Array(Math.ceil(SR * DUR));
-    var snaps = [
-      [0,   hz,        1.00, 0.008],   // press down
-      [GAP, hz * 0.78, 0.58, 0.006]    // release — lower, softer
-    ];
-    var nyq = SR * 0.45;
+    var n = Math.ceil(SR * 0.035), decayTo = Math.log(1e-4);
 
-    snaps.forEach(function (s) {
+    [[0,   hz,        1.00, 0.008],    // press down
+     [GAP, hz * 0.78, 0.58, 0.006]     // release — lower, softer
+    ].forEach(function (s) {
       var at = s[0], f = s[1], amp = s[2], decay = s[3];
-      var n = Math.ceil(SR * 0.035), x = new Float32Array(n), k = Math.log(1e-4);
-      for (var i = 0; i < n; i++) x[i] = (Math.random()*2-1) * Math.exp(k*(i/SR)/decay);
 
-      var body  = filt(x, bp(f, 8));                        // fundamental — the pitch
-      var upper = filt(x, bp(Math.min(f*2.4, nyq), 10));    // inharmonic partial — metal
-      var edge  = filt(x, hp(Math.min(f*3, nyq), 0.707));   // leading tick of the transient
+      var x = new Float32Array(n);
+      for (var i = 0; i < n; i++) x[i] = (Math.random()*2-1) * Math.exp(decayTo*(i/SR)/decay);
+
+      var body  = resonate(x, 'bp', f,       8);      // fundamental — the pitch
+      var upper = resonate(x, 'bp', f * 2.4, 10);     // inharmonic partial — metal
+      var edge  = resonate(x, 'hp', f * 3,   0.707);  // leading tick of the transient
 
       var off = Math.round(at * SR);
       for (var j = 0; j < n && off+j < out.length; j++)
@@ -170,13 +178,12 @@
 
   /* ---------- audio ---------- */
 
-  /* Runs at page load, not on first tap. Constructing an AudioContext is the
-     slow part, and it used to sit on the critical path of your first click. */
   function setup() {
     try { navigator.audioSession.type = 'playback'; } catch (e) {}   // beat the mute switch
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
 
+    // At load, not on first tap — constructing a context is the slow part.
     ctx = new AC({ latencyHint: 'interactive', sampleRate: SR });
     master = ctx.createGain();
     master.gain.value = VOL;
@@ -189,8 +196,10 @@
 
   /* iOS tears down the audio output route when nothing has played for a while,
      and rebuilding it on the next tap is what you hear as lag. An inaudible
-     loop keeps the route open. */
-  function keepAlive() {
+     loop, started on the first gesture, holds the route open. */
+  function unlock() {
+    if (unlocked) return;
+    unlocked = true;
     var b = ctx.createBuffer(1, SR, SR), d = b.getChannelData(0);
     for (var i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * 1e-7;
     var s = ctx.createBufferSource();
@@ -200,62 +209,83 @@
     s.start();
   }
 
-  function unlock() {
-    if (unlocked) return;
-    unlocked = true;
-    // A longer silent burst than before — one frame wasn't enough to make iOS
-    // actually open the route.
-    var warm = ctx.createBufferSource();
-    warm.buffer = ctx.createBuffer(1, Math.ceil(SR * 0.25), SR);
-    warm.connect(ctx.destination);
-    warm.start();
-    keepAlive();
-  }
-
   function play() {
-    if (!buffer) return;
     var src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(master);
     src.start();
   }
 
-  function flash() {
-    pupilEl.classList.remove('snap');
-    void pupilEl.offsetWidth;                       // reflow so repeat taps re-trigger
-    pupilEl.classList.add('snap');
-    setTimeout(function () { pupilEl.classList.remove('snap'); }, 30);
-    hintEl.classList.add('gone');
+  /* ---------- feedback ---------- */
+
+  /* Add a class, then drop it. The reflow lets a repeat call restart the
+     animation mid-flight, which blocked() needs during rapid tapping. */
+  function pulse(el, cls, ms) {
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    setTimeout(function () { el.classList.remove(cls); }, ms);
   }
 
-  function click() {
+  function flash()   { pulse(pupilEl, 'snap', 30); hintEl.classList.add('gone'); }
+  function blocked() { pulse(eyeEl, 'blocked', 60); }
+
+  /* ---------- input gating ---------- */
+
+  var lastFire = -1e9;
+
+  function fire() {
     flash();                                        // visual fires immediately, always
     if (!ctx) return;
-    if (ctx.state === 'running') { unlock(); play(); return; }
-    // resume() is async. Scheduling against a context that isn't running yet
-    // was the other half of the lag — wait for it instead.
-    ctx.resume().then(function () { unlock(); play(); }).catch(function () {});
+    var go = function () { unlock(); play(); };
+    // resume() is async — wait for it rather than scheduling into a dead context.
+    if (ctx.state === 'running') go();
+    else ctx.resume().then(go).catch(function () {});
   }
 
-  padEl.addEventListener('pointerdown', function (e) { e.preventDefault(); click(); });
+  function attempt(isPrimary) {
+    // A second finger or a palm resting on the screen should never click.
+    if (isPrimary === false) { blocked(); return; }
+
+    var now = performance.now();
+    // Only a successful click resets the clock. If a blocked tap reset it too,
+    // nervous tapping would lock you out indefinitely.
+    if (now - lastFire < LOCKOUT) { blocked(); return; }
+
+    lastFire = now;
+    fire();
+  }
+
+  padEl.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    attempt(e.isPrimary);
+  });
+
   padEl.addEventListener('keydown', function (e) {
-    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); click(); }
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); attempt(true); }
   });
 
-  // Keep the screen awake during a session; iOS drops the lock on backgrounding,
-  // and also leaves the audio context suspended when you come back.
+  /* ---------- session housekeeping ---------- */
+
   var lock = null;
+
   function requestLock() {
-    if (!('wakeLock' in navigator)) return;
-    navigator.wakeLock.request('screen').then(function (l) { lock = l; }).catch(function () {});
+    if (lock || !('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function (l) {
+      lock = l;
+      // iOS releases the lock on backgrounding. Clearing it here is what lets
+      // the visibilitychange handler below acquire a fresh one.
+      l.addEventListener('release', function () { lock = null; });
+    }).catch(function () {});
   }
+
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible') {
-      if (ctx && ctx.state === 'suspended') ctx.resume().catch(function () {});
-      requestLock();
-    }
+    if (document.visibilityState !== 'visible') return;
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(function () {});
+    requestLock();
   });
-  padEl.addEventListener('pointerdown', function () { if (!lock) requestLock(); }, { once: true });
+
+  padEl.addEventListener('pointerdown', requestLock, { once: true });
 
   setup();
 })();
